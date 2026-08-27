@@ -2,23 +2,18 @@ import hashlib
 import json
 import math
 import re
+import unicodedata
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-
 app = FastAPI()
-
-
-# ============================================================
-# Constants / regex
-# ============================================================
 
 SAFE_INT_MAX = (1 << 53) - 1
 
-URI_RE = re.compile(r"^gs://[^/]+/.+$")
+URI_RE = re.compile(r"^gs://[^/]+/[^/]+$")
 GENERATION_RE = re.compile(r"^[0-9]+$")
 CRC_RE = re.compile(r"^[0-9a-f]{8}$")
 
@@ -33,18 +28,20 @@ ROW_KEYS = {"id", "entity", "eventTime", "revision", "text"}
 
 
 # ============================================================
-# CRC32C Castagnoli
+# CRC32C - Castagnoli
 # ============================================================
 
 CRC32C_TABLE = []
 
 for i in range(256):
     crc = i
+
     for _ in range(8):
         if crc & 1:
             crc = (crc >> 1) ^ 0x82F63B78
         else:
             crc >>= 1
+
     CRC32C_TABLE.append(crc)
 
 
@@ -65,64 +62,60 @@ def crc32c_hex(data: bytes) -> str:
 # Unicode canonicalization
 # ============================================================
 
-def canonicalize_text(value: str) -> str:
-    value = value.encode("utf-8").decode("utf-8")
-    value = __import__("unicodedata").normalize("NFKC", value)
+def canonicalize(value: str) -> str:
+    value = unicodedata.normalize("NFKC", value)
     value = value.lower()
-
-    # Unicode whitespace -> one ASCII space
-    parts = value.split()
-    return " ".join(parts)
+    return " ".join(value.split())
 
 
 # ============================================================
-# Timestamp parsing
+# Timestamp validation / canonicalization
 # ============================================================
 
 def parse_timestamp(value: Any):
     if not isinstance(value, str):
         return None
 
-    m = TIME_RE.fullmatch(value)
+    match = TIME_RE.fullmatch(value)
 
-    if not m:
+    if match is None:
         return None
 
-    year = int(m.group(1))
-    month = int(m.group(2))
-    day = int(m.group(3))
-    hour = int(m.group(4))
-    minute = int(m.group(5))
-    second = int(m.group(6))
-    fraction = m.group(7) or ""
-    offset = m.group(8)
+    year = int(match.group(1))
+    month = int(match.group(2))
+    day = int(match.group(3))
+    hour = int(match.group(4))
+    minute = int(match.group(5))
+    second = int(match.group(6))
 
-    # Offset validity
-    if offset != "Z":
+    fraction = match.group(7) or ""
+    offset = match.group(8)
+
+    if offset == "Z":
+        tz = timezone.utc
+    else:
         sign = 1 if offset[0] == "+" else -1
-        off_hour = int(offset[1:3])
-        off_minute = int(offset[4:6])
 
-        if off_hour > 14:
+        offset_hour = int(offset[1:3])
+        offset_minute = int(offset[4:6])
+
+        if offset_hour > 14:
             return None
 
-        if off_minute > 59:
+        if offset_minute > 59:
             return None
 
-        if off_hour == 14 and off_minute != 0:
+        if offset_hour == 14 and offset_minute != 0:
             return None
 
         tz = timezone(
-            sign * timedelta(hours=off_hour, minutes=off_minute)
+            sign * timedelta(
+                hours=offset_hour,
+                minutes=offset_minute
+            )
         )
-    else:
-        tz = timezone.utc
 
-    # Milliseconds
-    if fraction:
-        millis = int(fraction.ljust(3, "0"))
-    else:
-        millis = 0
+    milliseconds = int(fraction.ljust(3, "0")) if fraction else 0
 
     try:
         dt = datetime(
@@ -132,7 +125,7 @@ def parse_timestamp(value: Any):
             hour,
             minute,
             second,
-            millis * 1000,
+            milliseconds * 1000,
             tzinfo=tz,
         )
     except ValueError:
@@ -147,8 +140,10 @@ def canonical_timestamp(value: str):
     if dt is None:
         return None
 
-    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + \
-        f"{dt.microsecond // 1000:03d}Z"
+    return (
+        dt.strftime("%Y-%m-%dT%H:%M:%S.")
+        + f"{dt.microsecond // 1000:03d}Z"
+    )
 
 
 # ============================================================
@@ -167,23 +162,31 @@ def validate_policy(policy: Any):
     if min_time is None or max_time is None:
         return False, None, None, None
 
-    if not isinstance(threshold, (int, float)) or isinstance(threshold, bool):
+    if (
+        isinstance(threshold, bool)
+        or not isinstance(threshold, (int, float))
+    ):
         return False, None, None, None
 
     if not math.isfinite(float(threshold)):
         return False, None, None, None
 
-    if not (0 <= float(threshold) <= 1):
+    if not 0 <= float(threshold) <= 1:
         return False, None, None, None
 
     if min_time > max_time:
         return False, None, None, None
 
-    return True, min_time, max_time, float(threshold)
+    return (
+        True,
+        min_time,
+        max_time,
+        float(threshold),
+    )
 
 
 # ============================================================
-# JSON serialization
+# Compact JSON
 # ============================================================
 
 def compact_json(value) -> str:
@@ -194,44 +197,51 @@ def compact_json(value) -> str:
     )
 
 
-def utf8_key(value: str):
-    return value.encode("utf-8")
-
-
 # ============================================================
-# Row validation
+# JSONL parser
 # ============================================================
 
 def parse_jsonl(content: Any):
     """
     Returns:
-        rows, object_has_jsonl_error, object_has_schema_error
+
+        rows
+        jsonl_invalid
+        schema_invalid
     """
 
     if not isinstance(content, str):
         return [], False, True
 
-    lines = content.splitlines()
+    lines = [
+        line
+        for line in content.splitlines()
+        if line.strip() != ""
+    ]
 
-    nonblank = [line for line in lines if line.strip() != ""]
-
-    if not nonblank:
+    # Empty JSONL file
+    if not lines:
         return [], False, True
 
     rows = []
 
-    for line in nonblank:
+    for line in lines:
+
+        # JSON parsing error
         try:
             obj = json.loads(line)
         except Exception:
             return [], True, False
 
+        # Every non-blank line must be an object
         if not isinstance(obj, dict):
             return [], False, True
 
+        # Exact key set
         if set(obj.keys()) != ROW_KEYS:
             return [], False, True
 
+        # Exact string fields
         if not isinstance(obj["id"], str):
             return [], False, True
 
@@ -244,6 +254,7 @@ def parse_jsonl(content: Any):
         if not isinstance(obj["text"], str):
             return [], False, True
 
+        # Revision must be non-negative safe integer
         revision = obj["revision"]
 
         if (
@@ -254,18 +265,21 @@ def parse_jsonl(content: Any):
         ):
             return [], False, True
 
-        parsed_time = parse_timestamp(obj["eventTime"])
+        # Event time must be valid
+        event_time = parse_timestamp(obj["eventTime"])
 
-        if parsed_time is None:
+        if event_time is None:
             return [], False, True
 
         rows.append(
             {
                 "id": obj["id"],
-                "entity": canonicalize_text(obj["entity"]),
-                "eventTime": canonical_timestamp(obj["eventTime"]),
+                "entity": canonicalize(obj["entity"]),
+                "eventTime": canonical_timestamp(
+                    obj["eventTime"]
+                ),
                 "revision": revision,
-                "text": canonicalize_text(obj["text"]),
+                "text": canonicalize(obj["text"]),
             }
         )
 
@@ -273,44 +287,39 @@ def parse_jsonl(content: Any):
 
 
 # ============================================================
-# Word sets for contamination
+# Word sets
 # ============================================================
 
 def unicode_word_set(value: str):
-    """
-    Extract runs consisting of Unicode letters/numbers.
-    Lowercase canonicalized text is already supplied.
-    """
-
-    import unicodedata
-
-    words = []
+    result = []
     current = []
 
-    for ch in value.lower():
-        category = unicodedata.category(ch)
+    for char in value.lower():
+
+        category = unicodedata.category(char)
 
         if category.startswith("L") or category.startswith("N"):
-            current.append(ch)
+            current.append(char)
+
         else:
             if current:
-                words.append("".join(current))
+                result.append("".join(current))
                 current = []
 
     if current:
-        words.append("".join(current))
+        result.append("".join(current))
 
-    return set(words)
+    return set(result)
 
 
 def row_word_set(row):
-    # The row's textual content is represented by entity + text.
     return unicode_word_set(
         row["entity"] + " " + row["text"]
     )
 
 
 def jaccard(a, b):
+
     if not a and not b:
         return 1.0
 
@@ -327,7 +336,7 @@ def jaccard(a, b):
 # ============================================================
 
 def serialize_row(row):
-    # Exact key order required by the specification.
+
     ordered = {
         "id": row["id"],
         "entity": row["entity"],
@@ -340,63 +349,68 @@ def serialize_row(row):
 
 
 def digest_rows(rows):
-    data = b"".join(
-        serialize_row(row).encode("utf-8") + b"\n"
-        for row in rows
-    )
+
+    data = b""
+
+    for row in rows:
+        data += serialize_row(row).encode("utf-8")
+        data += b"\n"
 
     return hashlib.sha256(data).hexdigest()
 
 
 # ============================================================
-# Rejection helpers
+# Reason sorting
 # ============================================================
 
-def add_reason(target, reason):
-    if reason not in target:
-        target.append(reason)
+def sort_reasons(reason_codes):
 
-
-def sort_reasons(reasons):
     return sorted(
-        set(reasons),
-        key=lambda x: x.encode("utf-8")
+        set(reason_codes),
+        key=lambda value: value.encode("utf-8"),
     )
 
 
-def make_rejected_row(row_id, reasons):
-    return {
-        "id": row_id,
-        "reasonCodes": sort_reasons(reasons),
-    }
-
-
 # ============================================================
-# Object processing
+# Object validation
 # ============================================================
 
-def process_object(obj):
-    """
-    Returns:
-        object_rejection_or_None,
-        parsed_rows
-    """
+def validate_object(obj):
 
     reasons = []
 
-    uri = obj.get("uri") if isinstance(obj, dict) else None
+    # --------------------------------------------------------
+    # Object itself
+    # --------------------------------------------------------
 
+    if not isinstance(obj, dict):
+
+        return (
+            {
+                "uri": None,
+                "reasonCodes": ["SCHEMA_INVALID"],
+            },
+            [],
+        )
+
+    # --------------------------------------------------------
     # URI
-    if not isinstance(uri, str) or URI_RE.fullmatch(uri) is None:
+    # --------------------------------------------------------
+
+    uri = obj.get("uri")
+
+    if (
+        not isinstance(uri, str)
+        or URI_RE.fullmatch(uri) is None
+    ):
         reasons.append("URI_INVALID")
 
-    # Generations
-    generation = obj.get("generation") if isinstance(obj, dict) else None
-    fetched_generation = (
-        obj.get("fetchedGeneration")
-        if isinstance(obj, dict)
-        else None
-    )
+    # --------------------------------------------------------
+    # Generation
+    # --------------------------------------------------------
+
+    generation = obj.get("generation")
+    fetched_generation = obj.get("fetchedGeneration")
 
     generation_valid = (
         isinstance(generation, str)
@@ -405,10 +419,15 @@ def process_object(obj):
 
     fetched_generation_valid = (
         isinstance(fetched_generation, str)
-        and GENERATION_RE.fullmatch(fetched_generation) is not None
+        and GENERATION_RE.fullmatch(
+            fetched_generation
+        ) is not None
     )
 
-    if not generation_valid or not fetched_generation_valid:
+    if (
+        not generation_valid
+        or not fetched_generation_valid
+    ):
         reasons.append("GENERATION_INVALID")
 
     if (
@@ -418,8 +437,11 @@ def process_object(obj):
     ):
         reasons.append("GENERATION_MISMATCH")
 
-    # CRC syntax
-    supplied_crc = obj.get("crc32c") if isinstance(obj, dict) else None
+    # --------------------------------------------------------
+    # CRC32C
+    # --------------------------------------------------------
+
+    supplied_crc = obj.get("crc32c")
 
     crc_valid = (
         isinstance(supplied_crc, str)
@@ -429,199 +451,307 @@ def process_object(obj):
     if not crc_valid:
         reasons.append("CRC32C_INVALID")
 
-    # Schema
-    schema_id = obj.get("schemaId") if isinstance(obj, dict) else None
-    content = obj.get("content") if isinstance(obj, dict) else None
+    # --------------------------------------------------------
+    # Schema / content
+    # --------------------------------------------------------
 
-    schema_valid = (
-        schema_id == "training-v1"
-        and isinstance(content, str)
-    )
+    schema_id = obj.get("schemaId")
+    content = obj.get("content")
 
-    if not schema_valid:
+    if schema_id != "training-v1":
         reasons.append("SCHEMA_INVALID")
 
-    # CRC mismatch only for string content + valid syntax
+    if not isinstance(content, str):
+        reasons.append("SCHEMA_INVALID")
+
+    # --------------------------------------------------------
+    # CRC mismatch
+    #
+    # Only check mismatch when:
+    #   - content is a string
+    #   - CRC syntax is valid
+    # --------------------------------------------------------
+
     if (
         isinstance(content, str)
         and crc_valid
     ):
-        actual_crc = crc32c_hex(content.encode("utf-8"))
+
+        actual_crc = crc32c_hex(
+            content.encode("utf-8")
+        )
 
         if actual_crc != supplied_crc:
             reasons.append("CRC32C_MISMATCH")
 
+    # --------------------------------------------------------
     # JSONL parsing
+    #
+    # This is deliberately independent from schemaId.
+    # --------------------------------------------------------
+
     rows = []
 
-    if schema_valid:
-        rows, jsonl_invalid, schema_row_invalid = parse_jsonl(content)
+    if isinstance(content, str):
+
+        (
+            rows,
+            jsonl_invalid,
+            schema_invalid,
+        ) = parse_jsonl(content)
 
         if jsonl_invalid:
             reasons.append("JSONL_INVALID")
 
-        if schema_row_invalid:
+        if schema_invalid:
             reasons.append("SCHEMA_INVALID")
+
+    # --------------------------------------------------------
+    # Final object result
+    # --------------------------------------------------------
 
     reasons = sort_reasons(reasons)
 
     if reasons:
+
         return (
             {
-                "uri": uri if isinstance(uri, str) else None,
+                "uri": (
+                    uri
+                    if isinstance(uri, str)
+                    else None
+                ),
                 "reasonCodes": reasons,
             },
-            []
+            [],
         )
 
     return None, rows
 
 
 # ============================================================
-# Main endpoint
+# API
 # ============================================================
 
 @app.post("/build-corpus")
 async def build_corpus(request: Request):
 
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(
-            status_code=400,
-            content={"error": "INVALID_INPUT"},
-        )
+    # --------------------------------------------------------
+    # Content-Type
+    # --------------------------------------------------------
 
-    if (
-        not isinstance(body, dict)
-        or "policy" not in body
-        or "objects" not in body
-        or not isinstance(body["objects"], list)
+    content_type = request.headers.get(
+        "content-type",
+        "",
+    )
+
+    if not content_type.lower().startswith(
+        "application/json"
     ):
         return JSONResponse(
             status_code=400,
-            content={"error": "INVALID_INPUT"},
+            content={
+                "error": "INVALID_INPUT"
+            },
         )
 
-    policy = body["policy"]
-    objects = body["objects"]
+    # --------------------------------------------------------
+    # Request JSON
+    # --------------------------------------------------------
 
-    policy_valid, min_time, max_time, threshold = validate_policy(
-        policy
+    try:
+        body = await request.json()
+
+    except Exception:
+
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "INVALID_INPUT"
+            },
+        )
+
+    # --------------------------------------------------------
+    # Top-level request validation
+    # --------------------------------------------------------
+
+    if not isinstance(body, dict):
+
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "INVALID_INPUT"
+            },
+        )
+
+    if "policy" not in body:
+
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "INVALID_INPUT"
+            },
+        )
+
+    if "objects" not in body:
+
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "INVALID_INPUT"
+            },
+        )
+
+    if not isinstance(body["objects"], list):
+
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "INVALID_INPUT"
+            },
+        )
+
+    # --------------------------------------------------------
+    # Policy
+    # --------------------------------------------------------
+
+    (
+        policy_valid,
+        min_time,
+        max_time,
+        contamination_threshold,
+    ) = validate_policy(
+        body["policy"]
     )
 
     rejected_objects = []
+    rejected_rows = []
+    lineage = []
     all_rows = []
 
-    lineage = []
-
     # --------------------------------------------------------
-    # Validate objects
+    # Objects
     # --------------------------------------------------------
 
-    for raw_obj in objects:
+    for obj in body["objects"]:
 
-        if not isinstance(raw_obj, dict):
-            rejected_objects.append(
-                {
-                    "uri": None,
-                    "reasonCodes": ["SCHEMA_INVALID"],
-                }
-            )
-            continue
-
-        rejection, rows = process_object(raw_obj)
+        rejection, rows = validate_object(obj)
 
         if rejection is not None:
-            rejected_objects.append(rejection)
+
+            rejected_objects.append(
+                rejection
+            )
+
             continue
 
-        # Object is valid enough to contribute lineage.
         lineage.append(
             {
-                "uri": raw_obj["uri"],
-                "generation": raw_obj["generation"],
-                "crc32c": raw_obj["crc32c"],
-                "schemaId": raw_obj["schemaId"],
+                "uri": obj["uri"],
+                "generation": obj["generation"],
+                "crc32c": obj["crc32c"],
+                "schemaId": obj["schemaId"],
             }
         )
 
         for row in rows:
-            row["_source_uri"] = raw_obj["uri"]
+
+            row["_source_uri"] = obj["uri"]
+
             all_rows.append(row)
 
-    # --------------------------------------------------------
-    # Deduplicate
-    # --------------------------------------------------------
+    # ========================================================
+    # Deduplication
+    # ========================================================
 
-    grouped = {}
+    groups = {}
 
     for row in all_rows:
+
         key = (
             row["entity"],
             row["eventTime"],
             row["text"],
         )
 
-        grouped.setdefault(key, []).append(row)
+        groups.setdefault(
+            key,
+            [],
+        ).append(row)
 
-    retained = []
-    rejected_rows = []
+    retained_rows = []
 
-    for _, candidates in grouped.items():
+    for candidates in groups.values():
 
         candidates.sort(
-            key=lambda r: (
-                -r["revision"],
-                utf8_key(r["id"]),
-                utf8_key(serialize_row(r)),
+            key=lambda row: (
+                -row["revision"],
+                row["id"].encode("utf-8"),
+                serialize_row(row).encode("utf-8"),
             )
         )
 
         winner = candidates[0]
-        retained.append(winner)
+
+        retained_rows.append(winner)
 
         for loser in candidates[1:]:
+
             rejected_rows.append(
-                make_rejected_row(
-                    loser["id"],
-                    ["DUPLICATE"],
-                )
+                {
+                    "id": loser["id"],
+                    "reasonCodes": [
+                        "DUPLICATE"
+                    ],
+                }
             )
 
-    # --------------------------------------------------------
+    # ========================================================
     # Policy + time window
-    # --------------------------------------------------------
+    # ========================================================
 
-    policy_filtered = []
+    policy_rows = []
 
-    for row in retained:
+    for row in retained_rows:
 
         if not policy_valid:
+
             rejected_rows.append(
-                make_rejected_row(
-                    row["id"],
-                    ["POLICY_INVALID"],
-                )
+                {
+                    "id": row["id"],
+                    "reasonCodes": [
+                        "POLICY_INVALID"
+                    ],
+                }
             )
+
             continue
 
-        row_time = parse_timestamp(row["eventTime"])
+        row_time = parse_timestamp(
+            row["eventTime"]
+        )
 
-        if row_time < min_time or row_time > max_time:
+        if (
+            row_time < min_time
+            or row_time > max_time
+        ):
+
             rejected_rows.append(
-                make_rejected_row(
-                    row["id"],
-                    ["OUT_OF_WINDOW"],
-                )
+                {
+                    "id": row["id"],
+                    "reasonCodes": [
+                        "OUT_OF_WINDOW"
+                    ],
+                }
             )
+
             continue
 
-        policy_filtered.append(row)
+        policy_rows.append(row)
 
-    # --------------------------------------------------------
-    # Deterministic bucket split
-    # --------------------------------------------------------
+    # ========================================================
+    # Deterministic split
+    # ========================================================
 
     splits = {
         "train": [],
@@ -629,155 +759,191 @@ async def build_corpus(request: Request):
         "test": [],
     }
 
-    for row in policy_filtered:
+    for row in policy_rows:
 
-        digest = hashlib.sha256(
+        entity_hash = hashlib.sha256(
             row["entity"].encode("utf-8")
         ).digest()
 
-        bucket = digest[0] % 10
+        bucket = entity_hash[0] % 10
 
         if bucket <= 5:
             split = "train"
+
         elif bucket <= 7:
             split = "validation"
+
         else:
             split = "test"
 
-        row["_split"] = split
         splits[split].append(row)
 
-    # --------------------------------------------------------
-    # Train contamination
-    # --------------------------------------------------------
+    # ========================================================
+    # Contamination
+    # ========================================================
 
-    train_word_sets = [
+    train_sets = [
         row_word_set(row)
         for row in splits["train"]
     ]
 
-    for split_name in ("validation", "test"):
+    for split_name in (
+        "validation",
+        "test",
+    ):
 
         kept = []
 
         for row in splits[split_name]:
 
-            words = row_word_set(row)
+            row_words = row_word_set(row)
 
             contaminated = False
 
-            for train_words in train_word_sets:
-                if jaccard(words, train_words) >= threshold:
+            for train_words in train_sets:
+
+                similarity = jaccard(
+                    row_words,
+                    train_words,
+                )
+
+                if (
+                    similarity
+                    >= contamination_threshold
+                ):
+
                     contaminated = True
                     break
 
             if contaminated:
+
                 rejected_rows.append(
-                    make_rejected_row(
-                        row["id"],
-                        ["TRAIN_CONTAMINATION"],
-                    )
+                    {
+                        "id": row["id"],
+                        "reasonCodes": [
+                            "TRAIN_CONTAMINATION"
+                        ],
+                    }
                 )
+
             else:
+
                 kept.append(row)
 
         splits[split_name] = kept
 
-    # --------------------------------------------------------
+    # ========================================================
     # Remove internal fields
-    # --------------------------------------------------------
+    # ========================================================
 
     for split_name in splits:
+
         for row in splits[split_name]:
-            row.pop("_source_uri", None)
-            row.pop("_split", None)
 
-    # --------------------------------------------------------
+            row.pop("_source_uri", None)
+
+    # ========================================================
     # Sort split rows
-    # --------------------------------------------------------
+    # ========================================================
 
     for split_name in splits:
+
         splits[split_name].sort(
             key=lambda row: (
-                utf8_key(row["id"]),
-                utf8_key(serialize_row(row)),
+                row["id"].encode("utf-8"),
+                serialize_row(row).encode("utf-8"),
             )
         )
 
-    # --------------------------------------------------------
-    # Sort rejected rows
-    # --------------------------------------------------------
+    # ========================================================
+    # Merge rejected rows with same ID
+    # ========================================================
 
-    # Merge identical rejected-row IDs/reasons.
-    rejected_map = {}
+    rejected_row_map = {}
 
     for item in rejected_rows:
 
         row_id = item["id"]
 
-        if row_id not in rejected_map:
-            rejected_map[row_id] = set()
+        if row_id not in rejected_row_map:
 
-        rejected_map[row_id].update(item["reasonCodes"])
+            rejected_row_map[row_id] = set()
 
-    rejected_rows = [
-        {
-            "id": row_id,
-            "reasonCodes": sort_reasons(
-                list(reasons)
-            ),
-        }
-        for row_id, reasons in rejected_map.items()
-    ]
+        rejected_row_map[row_id].update(
+            item["reasonCodes"]
+        )
+
+    rejected_rows = []
+
+    for row_id, reason_set in rejected_row_map.items():
+
+        rejected_rows.append(
+            {
+                "id": row_id,
+                "reasonCodes": sort_reasons(
+                    reason_set
+                ),
+            }
+        )
 
     rejected_rows.sort(
         key=lambda item: (
-            utf8_key(item["id"]),
-            utf8_key(compact_json(item)),
+            item["id"].encode("utf-8"),
+            compact_json(item).encode("utf-8"),
         )
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # Sort rejected objects
-    # --------------------------------------------------------
+    # ========================================================
 
     for item in rejected_objects:
+
         item["reasonCodes"] = sort_reasons(
             item["reasonCodes"]
         )
 
     rejected_objects.sort(
         key=lambda item: (
-            utf8_key(item["uri"]) if isinstance(item["uri"], str)
-            else b"",
-            utf8_key(compact_json(item)),
+            (
+                item["uri"].encode("utf-8")
+                if isinstance(item["uri"], str)
+                else b""
+            ),
+            compact_json(item).encode("utf-8"),
         )
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # Sort lineage
-    # --------------------------------------------------------
+    # ========================================================
 
     lineage.sort(
         key=lambda item: (
-            utf8_key(item["uri"]),
-            utf8_key(compact_json(item)),
+            item["uri"].encode("utf-8"),
+            compact_json(item).encode("utf-8"),
         )
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # Digests
-    # --------------------------------------------------------
+    # ========================================================
 
     digests = {
-        "train": digest_rows(splits["train"]),
-        "validation": digest_rows(splits["validation"]),
-        "test": digest_rows(splits["test"]),
+        "train": digest_rows(
+            splits["train"]
+        ),
+        "validation": digest_rows(
+            splits["validation"]
+        ),
+        "test": digest_rows(
+            splits["test"]
+        ),
     }
 
-    # --------------------------------------------------------
+    # ========================================================
     # Exact response shape
-    # --------------------------------------------------------
+    # ========================================================
 
     return {
         "splits": {
@@ -794,4 +960,6 @@ async def build_corpus(request: Request):
 
 @app.get("/")
 def root():
-    return {"status": "ok"}
+    return {
+        "status": "ok"
+    }
